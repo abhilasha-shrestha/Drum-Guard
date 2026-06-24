@@ -23,6 +23,8 @@
  */
 
 // ─────────────────────────── Includes ───────────────────────────────────────
+#include <driver/i2s.h>
+#include "arduinoFFT.h"
 #include <Wire.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -32,6 +34,15 @@
 #include <math.h>
 #include <Preferences.h>   // NVS – persist baseline across reboots
 
+// ─────────────────────────── Config ────────────────────────────────────────
+#define I2S_WS 15
+#define I2S_SD 13
+#define I2S_SCK 14
+#define I2S_PORT I2S_NUM_0
+
+#define I2S_SAMPLE_RATE     16000
+#define FFT_SAMPLES         1024  // Must be power of 2
+#define NOISE_FLOOR_HZ      4000  // Ignore < 4kHz
 // ─────────────────────────── User config ────────────────────────────────────
 #define WIFI_SSID        "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD    "YOUR_WIFI_PASSWORD"
@@ -54,6 +65,9 @@ Adafruit_INA219           ina219;
 WiFiClient                wifiClient;
 PubSubClient              mqtt(wifiClient);
 Preferences               prefs;
+double vReal[FFT_SAMPLES];
+double vImag[FFT_SAMPLES];
+arduinoFFT FFT = arduinoFFT(vReal, vImag, FFT_SAMPLES, I2S_SAMPLE_RATE);
 
 // ─────────────────────────── Welford state ──────────────────────────────────
 struct WelfordState {
@@ -65,6 +79,11 @@ struct WelfordState {
     }
 };
 
+// Shared state between RTOS cores
+volatile float latestHighBandEnergy = 0.0f;
+// Add to existing Welford states
+WelfordState audioState;
+double audioThreshold = 0.0;
 WelfordState vibState;
 WelfordState curState;
 
@@ -134,6 +153,9 @@ void saveBaseline() {
     prefs.putDouble("cur_mean",  curState.mean);
     prefs.putDouble("cur_m2",    curState.M2);
     prefs.putULong64("cur_cnt",  curState.count);
+    prefs.putDouble("aud_mean",  audioState.mean);
+    prefs.putDouble("aud_m2",    audioState.M2);
+    prefs.putULong64("aud_cnt",  audioState.count);
     prefs.putBool("calibrated",  true);
     prefs.end();
     Serial.println("[NVS] Baseline saved.");
@@ -151,6 +173,10 @@ bool loadBaseline() {
         curState.count = prefs.getULong64("cur_cnt", 0);
         vibThreshold   = vibState.mean + SIGMA_MULTIPLIER * vibState.stddev();
         curThreshold   = curState.mean + SIGMA_MULTIPLIER * curState.stddev();
+        audioState.mean  = prefs.getDouble("aud_mean", 0);
+        audioState.M2    = prefs.getDouble("aud_m2",   0);
+        audioState.count = prefs.getULong64("aud_cnt", 0);
+        audioThreshold   = audioState.mean + SIGMA_MULTIPLIER * audioState.stddev();
     }
     prefs.end();
     return ok;
@@ -183,8 +209,10 @@ void publishTelemetry(float vibRMS, float current, float anomalyScore,
     doc["status"]          = status;
     doc["vib_threshold"]   = vibThreshold;
     doc["cur_threshold"]   = curThreshold;
+    doc["audio_hf_energy"] = latestHighBandEnergy;
+    doc["aud_threshold"]   = audioThreshold;
     doc["calibrated"]      = calibrated;
-
+    
     char buf[256];
     serializeJson(doc, buf);
     mqtt.publish("drumguard/data", buf);
@@ -218,7 +246,67 @@ void connectWiFi() {
     Serial.print("[WiFi] Connected. IP: ");
     Serial.println(WiFi.localIP());
 }
+// ────────────────────────── I2S ──────────────────────────────────────────────
+void initI2S() {
+    i2s_config_t i2s_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = I2S_SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT, // INMP441 outputs 24-bit in 32-bit slot
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 8,
+        .dma_buf_len = 1024,
+        .use_apll = false,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0
+    };
 
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = I2S_SCK,
+        .ws_io_num = I2S_WS,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = I2S_SD
+    };
+
+    i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+    i2s_set_pin(I2S_PORT, &pin_config);
+}
+
+//Core 0 RTOS 
+void audioProcessingTask(void *pvParameters) {
+    int32_t i2s_buffer[FFT_SAMPLES];
+    size_t bytesIn;
+
+    for (;;) {
+        // Block until DMA fills the chunk
+        i2s_read(I2S_PORT, &i2s_buffer, sizeof(i2s_buffer), &bytesIn, portMAX_DELAY);
+        
+        // Extract 24-bit payload from 32-bit slot and populate FFT
+        for (int i = 0; i < FFT_SAMPLES; i++) {
+            vReal[i] = (double)(i2s_buffer[i] >> 8); 
+            vImag[i] = 0.0;
+        }
+
+        FFT.Windowing(FFT_WIN_TYP_HANNING, FFT_FORWARD);
+        FFT.Compute(FFT_FORWARD);
+        FFT.ComplexToMagnitude();
+
+        // Integrate high-frequency bins
+        double highBandEnergy = 0;
+        double binWidth = (double)I2S_SAMPLE_RATE / FFT_SAMPLES; 
+        int startBin = NOISE_FLOOR_HZ / binWidth; 
+        
+        for (int i = startBin; i < (FFT_SAMPLES / 2); i++) {
+            highBandEnergy += vReal[i]; 
+        }
+
+        // Thread-safe write
+        latestHighBandEnergy = (float)(highBandEnergy / 10000.0f); // Scale down for Welford sanity
+        
+        vTaskDelay(10 / portTICK_PERIOD_MS); // Yield
+    }
+}
 // ─────────────────────────── Setup ──────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
@@ -260,6 +348,17 @@ void setup() {
         calibStartMs = millis();
     }
 
+    initI2S();
+    xTaskCreatePinnedToCore(
+        audioProcessingTask,
+        "Audio_DSP",
+        10000,   // Stack size (FFT needs heap)
+        NULL,
+        1,       // Priority
+        NULL,
+        0        // Pin to Core 0
+    );
+
     lastSampleMs = millis();
 }
 
@@ -276,16 +375,19 @@ void loop() {
     // Read sensors
     float vibRMS  = readVibrationRMS();
     float current = readCurrentAmps();
+    float audioE  = latestHighBandEnergy;
 
     // ── Phase 1: Calibration ──────────────────────────────────────────────
     if (!calibrated) {
         welfordUpdate(vibState, vibRMS);
         welfordUpdate(curState, current);
-
+        welfordUpdate(audioState, audioE);
+        
         uint32_t elapsed = (now - calibStartMs) / 1000UL;
         if (elapsed >= CALIBRATION_DURATION_S) {
             vibThreshold = vibState.mean + SIGMA_MULTIPLIER * vibState.stddev();
             curThreshold = curState.mean + SIGMA_MULTIPLIER * curState.stddev();
+            audioThreshold = audioState.mean + SIGMA_MULTIPLIER * audioState.stddev();
             calibrated   = true;
             saveBaseline();
             Serial.printf("[CAL] Calibration complete after %lu samples.\n", (unsigned long)vibState.count);
@@ -308,10 +410,10 @@ void loop() {
     // Score > 1.0 means the sample breached its individual threshold.
     float vibScore = (vibThreshold > 0) ? (float)(vibRMS  / vibThreshold) : 0.0f;
     float curScore = (curThreshold > 0) ? (float)(current / curThreshold) : 0.0f;
-
+    float audScore = (audioThreshold > 0) ? (float)(audioE / audioThreshold) : 0.0f;
     // Combined anomaly score: max of the two normalised deviations.
     // Using max (not average) is conservative – either sensor breaching is enough.
-    float anomalyScore = (vibScore > curScore) ? vibScore : curScore;
+    float anomalyScore = max(vibScore, max(curScore, audScore));
 
     ringPush(anomalyScore);
 
